@@ -35,6 +35,7 @@ type Writer struct {
 	syncMarker       [16]byte
 	codec            Codec
 	recordsPerBlock  int64
+	bytesPerBlock    int
 	blockBuffer      *bytes.Buffer
 	compressedWriter io.Writer
 	nextBlockRecords int64
@@ -78,6 +79,15 @@ func NewWriter(writer io.Writer, codec Codec, recordsPerBlock int64, schema stri
 	return avroWriter, nil
 }
 
+func NewByteLimitedWriter(writer io.Writer, codec Codec, bytesPerBlock int, schema string) (*Writer, error) {
+	if w, err := NewWriter(writer, codec, 0, schema); err != nil {
+		return nil, err
+	} else {
+		w.bytesPerBlock = bytesPerBlock
+		return w, nil
+	}
+}
+
 func (avroWriter *Writer) writeHeader(schema string) error {
 	header := &avro.AvroContainerHeader{
 		Magic: [4]byte{'O', 'b', 'j', 1},
@@ -97,17 +107,35 @@ func (avroWriter *Writer) writeHeader(schema string) error {
 */
 func (avroWriter *Writer) WriteRecord(record AvroRecord) error {
 	var err error
-	// Serialize the new record into the compressed writer
-	err = record.Serialize(avroWriter.compressedWriter)
-	if err != nil {
-		return err
-	}
-	avroWriter.nextBlockRecords += 1
 
-	// If the block if full, flush and reset the compressed writer,
-	// write the header and the block contents
-	if avroWriter.nextBlockRecords >= avroWriter.recordsPerBlock {
-		return avroWriter.Flush()
+	if avroWriter.recordsPerBlock > 0 {
+		// Serialize the new record into the compressed writer
+		if err = record.Serialize(avroWriter.compressedWriter); err != nil {
+			return err
+		}
+		avroWriter.nextBlockRecords += 1
+
+		// If the block if full, flush and reset the compressed writer,
+		// write the header and the block contents
+		if avroWriter.nextBlockRecords >= avroWriter.recordsPerBlock {
+			return avroWriter.Flush()
+		}
+	} else {
+		// byte limited
+		buf := &bytes.Buffer{}
+		if err := record.Serialize(buf); err != nil {
+			return err
+		}
+
+		if avroWriter.nextBlockRecords > 0 && (avroWriter.blockBuffer.Len()+buf.Len()) > avroWriter.bytesPerBlock {
+			if err := avroWriter.Flush(); err != nil {
+				avroWriter.Flush()
+			}
+		}
+
+		if _, err := io.Copy(avroWriter.blockBuffer, buf); err != nil {
+			return err
+		}
 	}
 
 	return nil
